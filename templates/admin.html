@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block titulo %}Administración{% endblock %}
+
+{% block clase_tarjeta %}tarjeta-ancha{% endblock %}
+
+{% block contenido %}
+  <h2>Asistentes registrados</h2>
+  <p class="descripcion">Listado de inscripciones, de la más reciente a la más antigua.</p>
+
+  <!-- Resumen: total y conteo por área -->
+  <div class="resumen">
+    <div class="resumen-item total">
+      <span class="etiqueta-pequena">Total</span>
+      <span class="valor">{{ asistentes | length }}</span>
+    </div>
+    {% for area, cantidad in conteo_areas.items() %}
+      <div class="resumen-item">
+        <span class="etiqueta-pequena">{{ area }}</span>
+        <span class="valor">{{ cantidad }}</span>
+      </div>
+    {% endfor %}
+  </div>
+
+  <div class="tabla-contenedor">
+    {% if asistentes %}
+      <table class="tabla">
+        <thead>
+          <tr>
+            <th>N.º registro</th>
+            <th>Nombre</th>
+            <th>Email</th>
+            <th>Empresa</th>
+            <th>Área</th>
+            <th>Fecha</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for a in asistentes %}
+            <tr>
+              <td class="codigo">{{ a.numero_registro }}</td>
+              <td>{{ a.nombre }}</td>
+              <td>{{ a.email }}</td>
+              <td>{{ a.empresa }}</td>
+              <td>{{ a.area }}</td>
+              <td>{{ a.fecha_registro }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="vacio">Aún no hay asistentes registrados.</p>
+    {% endif %}
+  </div>
+{% endblock %}
