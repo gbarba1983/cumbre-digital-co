@@ -1,7 +1,7 @@
 """
 Servidor Flask de Cumbre Digital CO 2026.
 
-Registra asistentes en la base SQLite evento.db y muestra:
+Registra asistentes en la base PostgreSQL de Supabase y muestra:
   GET  /                        → formulario de registro
   POST /registro                → valida y guarda un asistente
   GET  /confirmacion/<numero>   → pantalla de registro exitoso
@@ -10,19 +10,27 @@ Registra asistentes en la base SQLite evento.db y muestra:
 
 import os
 import re
-import sqlite3
 import uuid
 
+import psycopg
+from dotenv import load_dotenv
 from flask import Flask, abort, g, redirect, render_template, request, url_for
+from psycopg.rows import dict_row
 
 # ============================================
 # Configuración
 # ============================================
-CARPETA_BASE = os.path.dirname(os.path.abspath(__file__))
+# En local lee el archivo .env; en Render no existe .env y se usan las
+# variables de entorno del panel (load_dotenv no sobrescribe las ya definidas)
+load_dotenv()
 
-# Ruta de la base de datos: evento.db en la raíz del proyecto, salvo que
-# la variable de entorno DB_PATH indique otra (útil en Render con disco persistente)
-RUTA_BD = os.environ.get("DB_PATH", os.path.join(CARPETA_BASE, "evento.db"))
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "Falta la variable de entorno DATABASE_URL. "
+        "En local, copia .env.example a .env y pon tu cadena de conexión de Supabase; "
+        "en Render, defínela en la sección Environment del servicio."
+    )
 
 AREAS = ["Tecnología", "Marketing", "Negocios", "Emprendimiento"]
 
@@ -38,10 +46,12 @@ app = Flask(__name__)
 # Base de datos
 # ============================================
 def obtener_bd():
-    """Devuelve la conexión SQLite de la petición actual (la crea si no existe)."""
+    """Devuelve la conexión PostgreSQL de la petición actual (la crea si no existe).
+
+    Las filas se devuelven como diccionarios (dict_row).
+    """
     if "bd" not in g:
-        g.bd = sqlite3.connect(RUTA_BD)
-        g.bd.row_factory = sqlite3.Row
+        g.bd = psycopg.connect(DATABASE_URL, row_factory=dict_row)
     return g.bd
 
 
@@ -53,23 +63,8 @@ def cerrar_bd(_error):
         bd.close()
 
 
-def init_db():
-    """Crea la tabla de asistentes si todavía no existe."""
-    areas_sql = ", ".join(f"'{area}'" for area in AREAS)
-    with sqlite3.connect(RUTA_BD) as bd:
-        bd.execute(f"""
-            CREATE TABLE IF NOT EXISTS asistentes (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                numero_registro TEXT    NOT NULL UNIQUE,
-                nombre          TEXT    NOT NULL,
-                email           TEXT    NOT NULL UNIQUE COLLATE NOCASE,
-                empresa         TEXT    NOT NULL,
-                area            TEXT    NOT NULL CHECK (area IN ({areas_sql})),
-                fecha_registro  TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
-            )
-        """)
-    # El bloque "with" confirma la transacción pero no cierra la conexión
-    bd.close()
+# La tabla "asistentes" ya existe en Supabase y se administra allí
+# (columnas: id, numero_registro, nombre, email, empresa, area_interes, fecha_registro).
 
 
 # ============================================
@@ -102,7 +97,7 @@ def validar(datos):
 def email_ya_registrado(email):
     """True si ya existe un asistente con ese email (sin distinguir mayúsculas)."""
     fila = obtener_bd().execute(
-        "SELECT 1 FROM asistentes WHERE email = ?", (email,)
+        "SELECT 1 FROM asistentes WHERE email = %s", (email,)
     ).fetchone()
     return fila is not None
 
@@ -140,19 +135,20 @@ def registrar():
     try:
         # Se inserta con un número temporal y, dentro de la misma transacción,
         # se reemplaza por REG-XXXX calculado a partir del id asignado.
-        cursor = bd.execute(
-            """INSERT INTO asistentes (numero_registro, nombre, email, empresa, area)
-               VALUES (?, ?, ?, ?, ?)""",
+        nuevo_id = bd.execute(
+            """INSERT INTO asistentes (numero_registro, nombre, email, empresa, area_interes)
+               VALUES (%s, %s, %s, %s, %s)
+               RETURNING id""",
             ("TMP-" + uuid.uuid4().hex, datos["nombre"], datos["email"],
              datos["empresa"], datos["area"]),
-        )
-        numero = f"REG-{cursor.lastrowid:04d}"
+        ).fetchone()["id"]
+        numero = f"REG-{nuevo_id:04d}"
         bd.execute(
-            "UPDATE asistentes SET numero_registro = ? WHERE id = ?",
-            (numero, cursor.lastrowid),
+            "UPDATE asistentes SET numero_registro = %s WHERE id = %s",
+            (numero, nuevo_id),
         )
         bd.commit()
-    except sqlite3.IntegrityError:
+    except psycopg.errors.UniqueViolation:
         # Caso raro: otra petición registró el mismo email al mismo tiempo
         bd.rollback()
         errores["email"] = MENSAJE_EMAIL_DUPLICADO
@@ -166,7 +162,8 @@ def registrar():
 def confirmacion(numero_registro):
     """Muestra los datos del asistente recién registrado."""
     asistente = obtener_bd().execute(
-        "SELECT numero_registro, nombre, area FROM asistentes WHERE numero_registro = ?",
+        """SELECT numero_registro, nombre, area_interes AS area
+           FROM asistentes WHERE numero_registro = %s""",
         (numero_registro,),
     ).fetchone()
     if asistente is None:
@@ -179,13 +176,18 @@ def admin():
     """Lista todos los asistentes con un conteo por área."""
     bd = obtener_bd()
     asistentes = bd.execute(
-        """SELECT numero_registro, nombre, email, empresa, area, fecha_registro
+        # fecha_registro se guarda en UTC (now() de Supabase); se muestra en hora de Colombia
+        """SELECT numero_registro, nombre, email, empresa, area_interes AS area,
+                  to_char(fecha_registro AT TIME ZONE 'UTC' AT TIME ZONE 'America/Bogota',
+                          'YYYY-MM-DD HH24:MI:SS') AS fecha_registro
            FROM asistentes ORDER BY id DESC"""
     ).fetchall()
 
     # Conteo por área, incluyendo las que aún no tienen inscritos
     conteo_areas = {area: 0 for area in AREAS}
-    for fila in bd.execute("SELECT area, COUNT(*) AS total FROM asistentes GROUP BY area"):
+    for fila in bd.execute(
+        "SELECT area_interes AS area, COUNT(*) AS total FROM asistentes GROUP BY area_interes"
+    ):
         conteo_areas[fila["area"]] = fila["total"]
 
     return render_template("admin.html", asistentes=asistentes, conteo_areas=conteo_areas)
@@ -211,9 +213,6 @@ def error_interno(_error):
         mensaje="Ocurrió un problema inesperado. Intenta de nuevo en unos minutos.",
     ), 500
 
-
-# Se ejecuta al importar el módulo (también con gunicorn en Render)
-init_db()
 
 if __name__ == "__main__":
     app.run(debug=True)
